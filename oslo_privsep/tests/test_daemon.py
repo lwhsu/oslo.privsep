@@ -308,3 +308,149 @@ class UnMonkeyPatch(base.BaseTestCase):
                                                      None)
                     original_attr = getattr(orig_mod, attr_name, None)
                     self.assertEqual(un_monkey_patched_attr, original_attr)
+
+
+@mock.patch('oslo_privsep.daemon.replace_logging') # To prevent log setup changes
+@mock.patch('oslo_privsep.daemon.set_cloexec')
+@mock.patch('oslo_privsep.daemon.comm.ServerChannel')
+@mock.patch('socket.socket') # Mock socket interactions for helper
+class TestMACDaemonIntegration(base.BaseTestCase):
+
+    def setUp(self):
+        super().setUp()
+        # Register privsep options for the test context
+        # Use a unique section name to avoid conflicts if other tests use 'privsep'
+        self.cfg_section = 'privsep_mac_test'
+        self.conf = cfg.CONF
+        self.conf.register_opts(priv_context.OPTS, group=self.cfg_section)
+
+        # Create a PrivContext instance for testing
+        # The pypath needs to be valid for the helper to import the context.
+        # We can point it to a static instance in this test module if needed,
+        # or mock importutils.import_class if full helper simulation is too complex.
+        self.context = priv_context.PrivContext(
+            prefix='oslo_privsep.tests.testctx', # Standard test context prefix
+            cfg_section=self.cfg_section,
+            pypath=f'{__name__}.test_context_instance' # Path to a global context for helper
+        )
+        # Make this context instance globally available for the fake_popen_side_effect
+        global test_context_instance
+        test_context_instance = self.context
+
+
+    def tearDown(self):
+        # Unregister opts to keep test environment clean
+        self.conf.unregister_opts(priv_context.OPTS, group=self.cfg_section)
+        if hasattr(self, 'context') and self.context.channel:
+            self.context.stop() # Ensure channel is stopped
+        super().tearDown()
+        global test_context_instance
+        test_context_instance = None
+
+
+    @mock.patch('subprocess.Popen')
+    @mock.patch.object(mac_framework, 'mac_set_proc', autospec=True)
+    @mock.patch.object(mac_framework, 'mac_get_proc', autospec=True)
+    @mock.patch.object(mac_framework, 'mac_to_text', autospec=True)
+    # Mock libmac availability for the MACDaemon's check
+    @mock.patch.object(mac_framework, 'libmac', create=True)
+    def test_mac_method_starts_helper_and_sets_label(self,
+                                                   mock_libmac_present, # For mac_framework.libmac
+                                                   mock_mac_to_text,
+                                                   mock_mac_get_proc,
+                                                   mock_mac_set_proc,
+                                                   mock_popen,
+                                                   mock_socket, # from class decorator
+                                                   mock_server_channel, # from class decorator
+                                                   mock_set_cloexec, # from class decorator
+                                                   mock_replace_logging # from class decorator
+                                                   ):
+        # Arrange
+        test_label = 'biba/test_integration_label'
+        self.conf.set_override('mac_daemon_label', test_label, group=self.cfg_section)
+        # Ensure the context re-reads the config if it caches it (it does via self.conf)
+        # No, self.context.conf directly accesses cfg.CONF[self.cfg_section]
+
+        # Mock Popen behavior
+        mock_proc_instance = mock.MagicMock(spec=subprocess.Popen)
+        mock_proc_instance.pid = 12345
+        mock_proc_instance.poll.return_value = None # Simulate process running initially
+        mock_popen.return_value = mock_proc_instance
+
+        # Simulate the helper side: when Popen is called with '--daemon-type mac',
+        # it should trigger the MACDaemon's setup which calls mac_set_proc.
+        original_import_class = daemon.importutils.import_class
+
+        def fake_popen_side_effect(cmd, *args, **kwargs):
+            # Simulate the privsep-helper main execution path for MAC daemon
+            if '--daemon-type' in cmd and 'mac' in cmd:
+                # Helper connects back to the client channel's listening socket.
+                # The actual socket comms are complex to mock fully.
+                # We assume the connection happens and focus on daemon setup.
+
+                # Reconstruct context as helper_main would
+                # The pypath 'oslo_privsep.tests.test_daemon.test_context_instance'
+                # should point back to self.context for this test.
+                pypath_arg_index = cmd.index('--privsep_context') + 1
+                context_pypath = cmd[pypath_arg_index]
+
+                # Mock import_class to return our specific context instance for the helper side
+                with mock.patch.object(daemon.importutils, 'import_class') as mock_import_class:
+                    mock_import_class.return_value = test_context_instance
+
+                    # Simulate parts of helper_main relevant to MACDaemon instantiation and setup
+                    mock_channel_for_daemon = mock.MagicMock(spec=comm.ServerChannel)
+
+                    # Ensure libmac is "available" for the MACDaemon's check
+                    mac_framework.libmac = mock_libmac_present # Use the patched libmac
+
+                    mac_daemon_instance = daemon.MACDaemon(channel=mock_channel_for_daemon,
+                                                           context=test_context_instance)
+                    # Call the setup method that should trigger mac_set_proc
+                    mac_daemon_instance.setup()
+            return mock_proc_instance
+
+        mock_popen.side_effect = fake_popen_side_effect
+
+        # Mock mac_get_proc and mac_to_text for label verification part
+        mock_mac_ptr = mock.MagicMock()
+        mock_mac_get_proc.return_value = mock_mac_ptr
+        mock_mac_to_text.return_value = test_label # Simulate label was set correctly
+
+        # Act
+        self.context.start(method=priv_context.Method.MAC)
+
+        # Assert
+        # 1. Popen was called with '--daemon-type mac'
+        popen_called_with_mac_type = False
+        actual_cmd_used = None
+        for call_args in mock_popen.call_args_list:
+            cmd_list = call_args[0][0]
+            actual_cmd_used = cmd_list # Capture command for logging if assert fails
+            if '--daemon-type' in cmd_list and 'mac' in cmd_list:
+                popen_called_with_mac_type = True
+                # Also check for privsep_context and sock_path
+                self.assertIn('--privsep_context', cmd_list)
+                self.assertIn(self.context.pypath, cmd_list)
+                self.assertIn('--privsep_sock_path', cmd_list)
+                break
+        self.assertTrue(popen_called_with_mac_type,
+                        f"subprocess.Popen was not called with --daemon-type mac. Called with: {actual_cmd_used}")
+
+        # 2. mac_set_proc was called with the correct label by the simulated daemon
+        mock_mac_set_proc.assert_called_once_with(test_label)
+
+        # 3. (Optional) Check if verification calls were made if label was set
+        if test_label:
+            mock_mac_get_proc.assert_called_once()
+            mock_mac_to_text.assert_called_once_with(mock_mac_ptr)
+
+        # Cleanup
+        self.context.stop()
+        # Ensure Popen's process is "terminated" if stop was called
+        if self.context.channel is None: # Check if channel was properly closed
+             mock_proc_instance.terminate.assert_called()
+
+
+# This global is used by fake_popen_side_effect to access the test's PrivContext instance
+test_context_instance = None

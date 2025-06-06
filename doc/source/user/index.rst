@@ -163,3 +163,85 @@ For more details, you can read the following blog post:
 .. _patch series: https://review.openstack.org/#/q/project:openstack/nova+branch:master+topic:my-own-personal-alternative-universe
 
 .. _Adding oslo privsep to a new project, a worked example: https://www.madebymikal.com/adding-oslo-privsep-to-a-new-project-a-worked-example/
+
+
+FreeBSD MAC Framework Support
+=============================
+
+oslo.privsep provides support for leveraging the FreeBSD Mandatory Access
+Control (MAC) framework. This allows the privsep daemon to run under a
+specific MAC label, enhancing security by utilizing FreeBSD's native MAC
+capabilities. This is an alternative to the traditional ``fork`` or
+``rootwrap`` methods for privilege separation.
+
+Using the MAC Method
+--------------------
+
+To use the MAC framework backend, you need to specify `Method.MAC` when
+starting the `PrivContext`.
+
+.. code-block:: python
+
+    from oslo_privsep import priv_context
+
+    # Assuming 'my_context' is an instance of PrivContext
+    my_context.start(method=priv_context.Method.MAC)
+
+This instructs oslo.privsep to use the `MACClientChannel` and `MACDaemon`,
+which are designed to work with the FreeBSD MAC framework.
+
+Configuration
+-------------
+
+A new configuration option is available for contexts that will use the
+`Method.MAC`:
+
+`mac_daemon_label`
+  Sets the MAC label that the `privsep-helper` daemon will attempt to apply to
+  itself.
+  * **Type**: String
+  * **Default**: `None` (the daemon runs with its default inherited label)
+  * **Example**: ``biba/low``, ``mls/high(low-high)``, ``seeplab/off``
+  * **Format**: The exact format of the label string is dependent on the
+    specific MAC policies (e.g., `mac_biba`, `mac_mls`, `mac_seeplabel`)
+    active and configured on the FreeBSD system.
+
+This option should be set in the configuration section corresponding to your
+`PrivContext`. For example, if your context's `cfg_section` is `privsep_my_service`:
+
+.. code-block:: ini
+
+    [privsep_my_service]
+    # ... other options like user, group ...
+    mac_daemon_label = biba/low
+
+System Configuration (FreeBSD)
+------------------------------
+
+To effectively use this backend:
+
+1.  The FreeBSD system must have the MAC framework enabled.
+2.  Relevant MAC policies (e.g., `mac_biba`, `mac_mls`, `mac_portacl`, etc.)
+    must be loaded and configured in the FreeBSD kernel and system settings.
+    Refer to the FreeBSD Handbook and `mac(4)`, `maclabel(7)`, and specific
+    policy man pages (e.g., `mac_biba(4)`) for details.
+3.  The user that `privsep-helper` runs as (either root or a user specified
+    via `sudo` in `helper_command`) must have the necessary permissions within
+    the MAC policy framework to transition to or operate under the specified
+    `mac_daemon_label`.
+
+Capability Mapping Note
+-----------------------
+
+The current implementation of the MAC backend focuses on setting an overall
+MAC label for the entire `privsep-helper` daemon process. This ensures the
+daemon operates within a security context defined by the chosen MAC policy
+and label.
+
+Direct mapping of Linux-style capabilities (e.g., `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`)
+to granular MAC policy enforcement (e.g., allowing only specific network
+operations based on a label) is **not yet implemented**. Such fine-grained
+control would require a more complex mapping layer and could be a
+future enhancement. The primary benefit of the current MAC support is the
+ability to confine the privsep daemon using FreeBSD's robust, system-wide
+MAC policies.
