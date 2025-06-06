@@ -72,6 +72,12 @@ OPTS = [
                 help=_('Print the exception traceback happened in the daemon '
                        'in the client logger'),
                 default=False),
+    cfg.StrOpt('mac_daemon_label',
+               default=None,
+               help=_('MAC label to apply to the privsep daemon when using '
+                      'the MAC method. The format depends on the active MAC '
+                      'policies on the FreeBSD system. Example: "biba/low". '
+                      'If not set, the daemon runs with its default label.'))
 ]
 
 _ENTRYPOINT_ATTR = 'privsep_entrypoint'
@@ -107,8 +113,35 @@ def _list_opts():
 
 @enum.unique
 class Method(enum.Enum):
+    """
+    Enumeration of supported privilege separation methods.
+
+    This enum defines the different strategies that can be used to start the
+    privsep daemon and establish communication.
+    """
     FORK = 1
+    """
+    Uses ``fork()`` to start the daemon. Assumes the current process has
+    sufficient privileges which will be dropped after forking. This is
+    generally the simplest and most secure method if the initial process
+    state allows it.
+    """
+
     ROOTWRAP = 2
+    """
+    Uses ``sudo`` and ``rootwrap`` (or a similar command configured via
+    ``helper_command``) to start the ``privsep-helper`` daemon.
+    Communication occurs over a Unix socket.
+    """
+
+    MAC = 3
+    """
+    Uses the FreeBSD Mandatory Access Control (MAC) framework. The
+    ``privsep-helper`` daemon is started (typically via ``sudo`` or a
+    custom ``helper_command``) and then transitions itself to a specific
+    MAC label defined by the ``mac_daemon_label`` configuration option.
+    This method is specific to FreeBSD systems with MAC framework enabled.
+    """
 
 
 def init(root_helper=None):
@@ -279,6 +312,10 @@ class PrivContext:
                 channel = daemon.RootwrapClientChannel(context=self)
             elif method is Method.FORK:
                 channel = daemon.ForkingClientChannel(context=self)
+            elif method is Method.MAC:
+                # MACClientChannel will be imported from oslo_privsep.daemon
+                # from oslo_privsep import daemon # Ensure this import exists or is added (already imported)
+                channel = daemon.MACClientChannel(context=self)
             else:
                 raise ValueError('Unknown method: %s' % method)
 

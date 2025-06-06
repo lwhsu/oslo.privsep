@@ -69,6 +69,8 @@ from oslo_utils import importutils
 from oslo_privsep._i18n import _
 from oslo_privsep import capabilities
 from oslo_privsep import comm
+from oslo_privsep import mac_framework # For MACDaemon
+from oslo_privsep.priv_context import Method # For MACDaemon logic (potentially)
 
 LOG = logging.getLogger(__name__)
 
@@ -187,10 +189,11 @@ class _ClientChannel(comm.ClientChannel):
     """Our protocol, layered on the basic primitives in comm.ClientChannel"""
 
     def __init__(self, sock, context):
-        self.log = logging.getLogger(context.conf.logger_name)
+        self.log = logging.getLogger(context.conf.logger_name) # Use context's configured logger name
         self.log_traceback = context.conf.log_daemon_traceback
         super().__init__(sock)
-        self.exchange_ping()
+        # No ping exchange here, will be done after helper is up
+        # self.exchange_ping()
 
     def exchange_ping(self):
         try:
@@ -334,102 +337,282 @@ class ForkingClientChannel(_ClientChannel):
 
         sock_b.close()
         super().__init__(sock_a, context)
+        self.exchange_ping()
 
 
 class RootwrapClientChannel(_ClientChannel):
     def __init__(self, context):
-        """Start privsep daemon using exec()
+        """Start privsep daemon using exec() via sudo/rootwrap.
 
         Uses sudo/rootwrap to gain privileges.
         """
+        self.context = context
+        self.sock = None
+        self.proc = None # Keep track of the helper process
 
+        self.setup()
+        super().__init__(self.sock, context)
+        self.exchange_ping()
+
+
+    def spawn_privsep_helper(self):
         listen_sock = socket.socket(socket.AF_UNIX)
-
-        # Note we listen() on the unprivileged side, and connect to it
-        # from the privileged process.  This means there is no exposed
-        # attack point on the privileged side.
-
-        # NB: Permissions on sockets are not checked on some (BSD) Unices
-        # so create socket in a private directory for safety.  Privsep
-        # daemon will (initially) be running as root, so will still be
-        # able to connect to sock path.
-        tmpdir = tempfile.mkdtemp()  # NB: created with 0700 perms
+        tmpdir = tempfile.mkdtemp()
+        sockpath = os.path.join(tmpdir, 'privsep.sock')
 
         try:
-            sockpath = os.path.join(tmpdir, 'privsep.sock')
             listen_sock.bind(sockpath)
             listen_sock.listen(1)
+            set_cloexec(listen_sock.fileno()) # Ensure listener is CLOEXEC
 
-            cmd = context.helper_command(sockpath)
-            LOG.info('Running privsep helper: %s', cmd)
-            proc = subprocess.Popen(cmd, shell=False, stderr=_fd_logger())
-            if proc.wait() != 0:
-                msg = ('privsep helper command exited non-zero (%s)' %
-                       proc.returncode)
-                LOG.critical(msg)
-                raise FailedToDropPrivileges(msg)
-            LOG.info('Spawned new privsep daemon via rootwrap')
+            # TODO(jules): Determine if privsep-helper needs a new CLI arg
+            # like --daemon-type=rootwrap for this channel vs MACClientChannel.
+            # For now, context.helper_command is generic.
+            cmd = self.context.helper_command(sockpath)
+            LOG.info('Running privsep helper (rootwrap): %s', cmd)
+            # Note: preexec_fn=os.setpgrp to run in new process group,
+            # though not strictly necessary for rootwrap if not managing it closely.
+            self.proc = subprocess.Popen(cmd, shell=False, stderr=_fd_logger())
 
-            sock, _addr = listen_sock.accept()
-            LOG.debug('Accepted privsep connection to %s', sockpath)
+            # Wait for the helper to connect back or exit
+            # A timeout here might be useful.
+            conn_sock, _addr = listen_sock.accept()
+            LOG.debug('Accepted privsep connection to %s from rootwrap helper', sockpath)
+
+            # Check if helper process exited prematurely
+            if self.proc.poll() is not None:
+                # Process terminated, check return code
+                if self.proc.returncode != 0:
+                    msg = ('privsep helper command exited non-zero (%s) during connect' %
+                           self.proc.returncode)
+                    LOG.critical(msg)
+                    conn_sock.close() # Close connection before raising
+                    raise FailedToDropPrivileges(msg)
+                else: # Should not happen if it exited cleanly before connect
+                    LOG.warning("privsep helper exited with 0 before connect completed.")
+                    conn_sock.close()
+                    raise FailedToDropPrivileges("privsep helper exited prematurely")
+
+
+            self.sock = conn_sock
+            set_cloexec(self.sock.fileno())
 
         finally:
-            # Don't need listen_sock anymore, so clean up.
             listen_sock.close()
             try:
                 os.unlink(sockpath)
             except OSError as e:
                 if e.errno != errno.ENOENT:
-                    raise
-            os.rmdir(tmpdir)
+                    LOG.warning("Failed to unlink %s: %s", sockpath, e)
+            try:
+                os.rmdir(tmpdir)
+            except OSError as e:
+                if e.errno != errno.ENOENT and e.errno != errno.ENOTEMPTY :
+                    LOG.warning("Failed to rmdir %s: %s", tmpdir, e)
 
-        super().__init__(sock, context)
+        # Check if the process started successfully after connection established
+        if self.proc.poll() is not None:
+             if self.proc.returncode != 0:
+                msg = ('privsep helper command exited non-zero (%s) immediately after connect' %
+                       self.proc.returncode)
+                LOG.critical(msg)
+                if self.sock:
+                    self.sock.close()
+                raise FailedToDropPrivileges(msg)
+
+
+    def setup(self):
+        """Sets up the client channel by spawning the helper."""
+        if self.sock is None:
+            self.spawn_privsep_helper()
+
+    def stop(self):
+        """Stops the client channel and helper process."""
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+        if self.proc and self.proc.poll() is None: # if process is running
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5) # Give it a moment to terminate
+            except subprocess.TimeoutExpired:
+                LOG.warning("Privsep helper (rootwrap) did not terminate gracefully, sending SIGKILL.")
+                self.proc.kill()
+            except Exception as e:
+                LOG.error("Error terminating privsep helper (rootwrap): %s", e)
+            self.proc = None
+        LOG.info('Rootwrap privsep channel stopped.')
+
+    def close(self):
+        self.stop()
+        super().close()
+
+
+class MACClientChannel(_ClientChannel):
+    """Client channel for FreeBSD MAC method."""
+    def __init__(self, context):
+        self.context = context
+        self.sock = None
+        self.proc = None # Keep track of the helper process
+
+        self.setup()
+        super().__init__(self.sock, context)
+        self.exchange_ping()
+
+    def spawn_privsep_helper(self):
+        """
+        Spawns the privsep-helper.
+        The exact command and environment for MAC-based privilege separation
+        might need refinement (e.g., using setpmac or specific user with labels).
+        For now, it relies on context.helper_command() which might use sudo.
+        """
+        listen_sock = socket.socket(socket.AF_UNIX)
+        tmpdir = tempfile.mkdtemp()
+        sockpath = os.path.join(tmpdir, 'privsep.sock')
+
+        try:
+            listen_sock.bind(sockpath)
+            listen_sock.listen(1)
+            set_cloexec(listen_sock.fileno())
+
+            # TODO(jules): The command from helper_command() might need adjustment
+            # for MAC. For example, instead of plain 'sudo', it might need
+            # 'sudo -u mac_privileged_user' or a specific tool like 'setpmac'.
+            # This depends on how MAC policies are configured on the system.
+            # It's also possible privsep-helper needs a new CLI arg like
+            # --daemon-type=mac to tell it to instantiate MACDaemon.
+            cmd = self.context.helper_command(sockpath)
+            # Add --daemon-type=mac to the command for privsep-helper
+            cmd_mac = cmd + ['--daemon-type', 'mac']
+            LOG.info('Running privsep helper (MAC): %s', cmd_mac)
+
+            # or be handled by the command itself (e.g. sudo to a user with labels)
+            self.proc = subprocess.Popen(cmd_mac, shell=False, stderr=_fd_logger())
+
+            conn_sock, _addr = listen_sock.accept()
+            LOG.debug('Accepted privsep connection to %s from MAC helper', sockpath)
+
+            if self.proc.poll() is not None:
+                if self.proc.returncode != 0:
+                    msg = ('privsep helper (MAC) command exited non-zero (%s) during connect' %
+                           self.proc.returncode)
+                    LOG.critical(msg)
+                    conn_sock.close()
+                    raise FailedToDropPrivileges(msg)
+                else:
+                    LOG.warning("privsep helper (MAC) exited with 0 before connect completed.")
+                    conn_sock.close()
+                    raise FailedToDropPrivileges("privsep helper (MAC) exited prematurely")
+
+            self.sock = conn_sock
+            set_cloexec(self.sock.fileno())
+
+        finally:
+            listen_sock.close()
+            try:
+                os.unlink(sockpath)
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    LOG.warning("Failed to unlink %s: %s", sockpath, e)
+            try:
+                os.rmdir(tmpdir)
+            except OSError as e:
+                if e.errno != errno.ENOENT and e.errno != errno.ENOTEMPTY :
+                    LOG.warning("Failed to rmdir %s: %s", tmpdir, e)
+
+        if self.proc.poll() is not None:
+             if self.proc.returncode != 0:
+                msg = ('privsep helper (MAC) command exited non-zero (%s) immediately after connect' %
+                       self.proc.returncode)
+                LOG.critical(msg)
+                if self.sock:
+                    self.sock.close()
+                raise FailedToDropPrivileges(msg)
+
+
+    def setup(self):
+        """Sets up the client channel by spawning the helper."""
+        if self.sock is None:
+            self.spawn_privsep_helper()
+
+    def stop(self):
+        """Stops the client channel and helper process."""
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                LOG.warning("Privsep helper (MAC) did not terminate gracefully, sending SIGKILL.")
+                self.proc.kill()
+            except Exception as e:
+                LOG.error("Error terminating privsep helper (MAC): %s", e)
+            self.proc = None
+        LOG.info('MAC privsep channel stopped.')
+
+    def close(self):
+        self.stop()
+        super().close()
 
 
 class Daemon:
-    """NB: This doesn't fork() - do that yourself before calling run()"""
+    """Base class for privsep daemons.
+    NB: This doesn't fork() - do that yourself before calling run()"""
 
     def __init__(self, channel, context):
         self.channel = channel
         self.context = context
-        self.user = context.conf.user
-        self.group = context.conf.group
-        self.caps = set(context.conf.capabilities)
         self.thread_pool = futures.ThreadPoolExecutor(
             context.conf.thread_pool_size)
         self.communication_error = None
 
-    def run(self):
-        """Run request loop. Sets up environment, then calls loop()"""
+    def setup(self):
+        """Basic environment setup for the daemon."""
         os.chdir("/")
         os.umask(0)
-        self._drop_privs()
+        self._set_process_privileges()
         self._close_stdio()
 
+    def run(self):
+        """Run request loop. Sets up environment, then calls loop()"""
+        self.setup()
         self.loop()
 
     def _close_stdio(self):
+        # stderr is left untouched by default, allowing logs from here to escape
+        # if not otherwise redirected by the calling process (e.g. _fd_logger in channels)
         with open(os.devnull, 'w+') as devnull:
             os.dup2(devnull.fileno(), StdioFd.STDIN)
-            os.dup2(devnull.fileno(), StdioFd.STDOUT)
-            # stderr is left untouched
+            # Only redirect stdout if it's not our logging fd (if stderr is used for that)
+            # or if some specific logging setup for daemon indicates otherwise.
+            # For now, let's assume stdout can also go to devnull unless stderr is used for primary output.
+            if StdioFd.STDOUT != sys.stderr.fileno(): # Basic check
+                 os.dup2(devnull.fileno(), StdioFd.STDOUT)
 
-    def _drop_privs(self):
+
+    def _set_process_privileges(self):
+        """Sets UID, GID, and capabilities for the daemon process."""
+        user = self.context.conf.user
+        group = self.context.conf.group
+        caps = set(self.context.conf.capabilities)
+
         try:
             # Keep current capabilities across setuid away from root.
             capabilities.set_keepcaps(True)
 
-            if self.group is not None:
+            if group is not None:
                 try:
                     os.setgroups([])
                 except OSError:
                     msg = _('Failed to remove supplemental groups')
                     LOG.critical(msg)
                     raise FailedToDropPrivileges(msg)
-                setgid(self.group)
+                setgid(group)
 
-            if self.user is not None:
-                setuid(self.user)
+            if user is not None:
+                setuid(user)
 
         finally:
             capabilities.set_keepcaps(False)
@@ -437,7 +620,7 @@ class Daemon:
         LOG.info('privsep process running with uid/gid: %(uid)s/%(gid)s',
                  {'uid': os.getuid(), 'gid': os.getgid()})
 
-        capabilities.drop_all_caps_except(self.caps, self.caps, [])
+        capabilities.drop_all_caps_except(caps, caps, [])
 
         def fmt_caps(capset):
             if not capset:
@@ -457,45 +640,40 @@ class Daemon:
                 'inh': fmt_caps(inh),
             })
 
-    def _process_cmd(self, msgid, cmd, *args):
-        """Executes the requested command in an execution thread.
+    def handle_command(self, msgid, cmd, *args):
+        """Executes the requested command.
 
-        This executes a call within a thread executor and returns the results
-        of the execution.
-
-        :param msgid: The message identifier.
-        :param cmd: The `Message` type indicating the command type.
-        :param args: The function, args, and kwargs if a Message.CALL type.
-        :return: A tuple of the return status, optional call output, and
-                 optional error information.
+        Can be overridden by subclasses for different command processing.
+        This default implementation handles PING and CALL messages.
         """
         if cmd == comm.Message.PING:
             return (comm.Message.PONG.value,)
 
-        try:
-            if cmd != comm.Message.CALL:
-                raise ProtocolError(_('Unknown privsep cmd: %s') % cmd)
-
-            # Extract the callable and arguments
+        if cmd == comm.Message.CALL:
             name, f_args, f_kwargs = args
-            func = importutils.import_class(name)
-            if not self.context.is_entrypoint(func):
-                msg = _('Invalid privsep function: %s not exported') % name
-                raise NameError(msg)
+            try:
+                func = importutils.import_class(name)
+                if not self.context.is_entrypoint(func):
+                    msg = _('Invalid privsep function: %s not exported by context %s') % (
+                        name, self.context.pypath or self.context.cfg_section)
+                    raise NameError(msg)
 
-            ret = func(*f_args, **f_kwargs)
-            return (comm.Message.RET.value, ret)
-        except Exception as e:
-            LOG.debug(
-                'privsep: Exception during request[%(msgid)s]: '
-                '%(err)s', {'msgid': msgid, 'err': e}, exc_info=True)
-            cls = e.__class__
-            cls_name = '{}.{}'.format(cls.__module__, cls.__name__)
-            return (comm.Message.ERR.value, cls_name, e.args,
-                    traceback.format_exc())
+                ret = func(*f_args, **f_kwargs)
+                return (comm.Message.RET.value, ret)
+            except Exception as e:
+                LOG.debug(
+                    'privsep: Exception during CALL[%(msgid)s] %(name)s: %(err)s',
+                    {'msgid': msgid, 'name': name, 'err': e}, exc_info=True)
+                cls = e.__class__
+                cls_name = '{}.{}'.format(cls.__module__, cls.__name__)
+                return (comm.Message.ERR.value, cls_name, e.args,
+                        traceback.format_exc())
+        else:
+            raise ProtocolError(_('Unknown privsep cmd: %s') % cmd)
+
 
     def _create_done_callback(self, msgid):
-        """Creates a future callback to receive command execution results.
+        """Creates a future callback to send command execution results back.
 
         :param msgid: The message identifier.
         :return: A future reply callback.
@@ -538,27 +716,104 @@ class Daemon:
         self.context.set_client_mode(False)
 
         for msgid, msg in self.channel:
-            error = self.communication_error
-            if error:
-                if error.errno == errno.EPIPE:
-                    # Write stream closed, exit loop
-                    break
-                raise error
+            if self.communication_error:
+                if self.communication_error.errno == errno.EPIPE:
+                    LOG.info("Client disconnected (EPIPE), exiting privsep loop.")
+                    break # Write stream closed, exit loop
+                raise self.communication_error # Other communication error
 
             # Submit the command for execution
-            future = self.thread_pool.submit(self._process_cmd, msgid, *msg)
+            future = self.thread_pool.submit(self.handle_command, msgid, *msg)
             future.add_done_callback(self._create_done_callback(msgid))
 
-        LOG.debug('Socket closed, shutting down privsep daemon')
+        LOG.debug('Socket closed or communication error, shutting down privsep daemon')
+        self.thread_pool.shutdown() # Clean up thread pool
+
+
+class MACDaemon(Daemon):
+    """Daemon variant for FreeBSD MAC Framework."""
+
+    def _setup_mac_environment(self):
+        """Sets the MAC label for the daemon process.
+
+        Placeholder: Actual implementation will involve getting the target label
+        from configuration (via self.context) and using mac_framework functions.
+        """
+        target_label = self.context.conf.mac_daemon_label
+        if target_label:
+            if mac_framework.libmac is None:
+                LOG.error("MAC framework (libmac) not loaded. Cannot set MAC label. "
+                          "Ensure this is running on a MAC-enabled FreeBSD system.")
+                # Depending on policy, this might be a critical failure.
+                # For now, log an error and continue; privileges might still be
+                # managed by UID/GID/Capabilities if MAC isn't enforcing.
+                # Consider raising FailedToDropPrivileges if MAC is mandatory.
+                return
+
+            try:
+                LOG.info("Attempting to set MAC process label to: %s", target_label)
+                mac_framework.mac_set_proc(target_label)
+                # Verify by getting the label, if possible and desired
+                current_label_obj = mac_framework.mac_get_proc()
+                current_label_text = mac_framework.mac_to_text(current_label_obj)
+                mac_framework.mac_free(current_label_obj)
+                if current_label_text == target_label:
+                    LOG.info("Successfully set and verified MAC process label: %s", current_label_text)
+                else:
+                    # This case might indicate that the set operation was silently ignored
+                    # or modified by the system/policy.
+                    LOG.warning("MAC process label after set ('%s') does not match target ('%s'). "
+                                "This may be due to policy restrictions.",
+                                current_label_text, target_label)
+            except OSError as e:
+                LOG.error("Failed to set MAC process label to '%s': %s. Check MAC policies and permissions.",
+                          target_label, e)
+                # Depending on the strictness required, this could raise an exception.
+                # For example: raise FailedToDropPrivileges(f"Failed to set MAC label '{target_label}': {e}")
+                # If the system MUST run with this label, this is a critical failure.
+            except Exception as e: # Catch other potential errors from mac_framework calls
+                LOG.error("An unexpected error occurred while setting MAC process label to '%s': %s",
+                          target_label, e)
+        else:
+            LOG.info("No 'mac_daemon_label' configured for context '%s'. "
+                     "Daemon will run with its default/inherited MAC label.", self.context.cfg_section)
+
+    def setup(self):
+        """Sets up the MAC daemon environment."""
+        # First, perform MAC-specific setup
+        self._setup_mac_environment()
+
+        # Then, call the parent setup to handle generic daemon setup like
+        # dropping privileges (UID/GID/caps) and closing stdio.
+        super().setup()
+        LOG.info("MACDaemon setup complete.")
+
+    # handle_command can be inherited from Daemon if no MAC-specific handling is needed.
+
+
+# Mapping of daemon types to classes for privsep-helper
+DAEMON_TYPE_MAP = {
+    'default': Daemon, # Generic daemon
+    'mac': MACDaemon,
+    # 'rootwrap': Daemon, # Rootwrap uses the default Daemon class internally
+}
 
 
 def helper_main():
     """Start privileged process, serving requests over a Unix socket."""
 
-    cfg.CONF.register_cli_opts([
-        cfg.StrOpt('privsep_context', required=True),
-        cfg.StrOpt('privsep_sock_path', required=True),
-    ])
+    cli_opts = [
+        cfg.StrOpt('privsep_context', required=True,
+                   help='Python path to the PrivContext object.'),
+        cfg.StrOpt('privsep_sock_path', required=True,
+                   help='Path to the Unix domain socket for communication.'),
+        cfg.StrOpt('daemon_type', default='default',
+                   choices=list(DAEMON_TYPE_MAP.keys()),
+                   help='Type of daemon to run (e.g., default, mac). '
+                        'This allows privsep-helper to start the correct '
+                        'daemon subclass if needed.')
+    ]
+    cfg.CONF.register_cli_opts(cli_opts)
 
     logging.register_options(cfg.CONF)
 
@@ -571,37 +826,60 @@ def helper_main():
     if not isinstance(context, priv_context.PrivContext):
         LOG.fatal('--privsep_context must be the (python) name of a '
                   'PrivContext object')
+        sys.exit(1) # Ensure exit on fatal error
 
     sock = socket.socket(socket.AF_UNIX)
-    sock.connect(cfg.CONF.privsep_sock_path)
+    try:
+        sock.connect(cfg.CONF.privsep_sock_path)
+    except socket.error as e:
+        LOG.fatal("Failed to connect to socket %s: %s", cfg.CONF.privsep_sock_path, e)
+        sys.exit(1)
+
     set_cloexec(sock)
     channel = comm.ServerChannel(sock)
 
     # Channel is set up, so fork off daemon "in the background" and exit
+    # This first fork is to detach from the invoking process (e.g. sudo)
     if os.fork() != 0:
         # parent
-        return
+        os._exit(0) # Use _exit to avoid running atexit handlers from parent
 
-    # child
+    # child (soon to be the daemon process)
 
     # Note we don't move into a new process group/session like a
     # regular daemon might, since we _want_ to remain associated with
-    # the originating (unprivileged) process.
+    # the originating (unprivileged) process's lifecycle indirectly.
+    # os.setsid() # Uncomment if full daemonization (new session) is desired.
 
-    # Channel is set up now, so move to in-band logging
-    replace_logging(PrivsepLogHandler(channel))
+    # Channel is set up now, so move to in-band logging via the channel
+    replace_logging(PrivsepLogHandler(channel, processName=f"privsep-helper[{os.getpid()}]"))
 
-    LOG.info('privsep daemon starting')
+    LOG.info('privsep daemon (type: %s) starting with context: %s',
+             cfg.CONF.daemon_type, cfg.CONF.privsep_context)
+
+    DaemonClass = DAEMON_TYPE_MAP.get(cfg.CONF.daemon_type, Daemon)
 
     try:
-        Daemon(channel, context).run()
+        daemon_instance = DaemonClass(channel, context)
+        daemon_instance.run()
     except Exception as e:
-        LOG.exception(e)
-        sys.exit(str(e))
+        LOG.exception("Unhandled exception in privsep daemon: %s", e) # Log full traceback
+        # Attempt to send error to client if channel is still usable
+        try:
+            cls_name = '{}.{}'.format(e.__class__.__module__, e.__class__.__name__)
+            error_reply = (comm.Message.ERR.value, cls_name, e.args, traceback.format_exc())
+            # Use a direct send, as the loop/callback mechanism is bypassed here
+            channel.send((None, error_reply)) # msgid is None as it's an out-of-band error
+        except Exception as send_e:
+            LOG.error("Failed to send final error to client: %s", send_e)
+        sys.exit(str(e)) # Exit with error message
 
-    LOG.debug('privsep daemon exiting')
+    LOG.info('privsep daemon (type: %s) exiting cleanly.', cfg.CONF.daemon_type)
     sys.exit(0)
 
 
 if __name__ == '__main__':
+    # This check ensures that helper_main() is called only when the script
+    # is executed directly, not when imported as a module.
+    # This is important if other parts of oslo_privsep might import daemon.py.
     helper_main()
