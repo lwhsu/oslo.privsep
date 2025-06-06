@@ -72,6 +72,10 @@ OPTS = [
                 help=_('Print the exception traceback happened in the daemon '
                        'in the client logger'),
                 default=False),
+    cfg.StrOpt('mac_label',
+               help=_('MAC label to apply to the privsep daemon when running '
+                      'on FreeBSD.'),
+               default=None),
 ]
 
 _ENTRYPOINT_ATTR = 'privsep_entrypoint'
@@ -157,6 +161,8 @@ class PrivContext:
                              default=capabilities)
         cfg.CONF.set_default('logger_name', group=cfg_section,
                              default=logger_name)
+        cfg.CONF.set_default('mac_label', group=cfg_section,
+                             default=None)
         self.timeout = timeout
 
     @property

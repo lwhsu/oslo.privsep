@@ -394,6 +394,7 @@ class Daemon:
         self.context = context
         self.user = context.conf.user
         self.group = context.conf.group
+        self.mac_label = context.conf.mac_label
         self.caps = set(context.conf.capabilities)
         self.thread_pool = futures.ThreadPoolExecutor(
             context.conf.thread_pool_size)
@@ -436,26 +437,30 @@ class Daemon:
 
         LOG.info('privsep process running with uid/gid: %(uid)s/%(gid)s',
                  {'uid': os.getuid(), 'gid': os.getgid()})
+        if sys.platform.startswith('linux'):
+            capabilities.drop_all_caps_except(self.caps, self.caps, [])
 
-        capabilities.drop_all_caps_except(self.caps, self.caps, [])
+            def fmt_caps(capset):
+                if not capset:
+                    return 'none'
+                fc = [capabilities.CAPS_BYVALUE.get(c, str(c))
+                      for c in capset]
+                fc.sort()
+                return '|'.join(fc)
 
-        def fmt_caps(capset):
-            if not capset:
-                return 'none'
-            fc = [capabilities.CAPS_BYVALUE.get(c, str(c))
-                  for c in capset]
-            fc.sort()
-            return '|'.join(fc)
-
-        eff, prm, inh = capabilities.get_caps()
-        LOG.info(
-            'privsep process running with capabilities '
-            '(eff/prm/inh): %(eff)s/%(prm)s/%(inh)s',
-            {
-                'eff': fmt_caps(eff),
-                'prm': fmt_caps(prm),
-                'inh': fmt_caps(inh),
-            })
+            eff, prm, inh = capabilities.get_caps()
+            LOG.info(
+                'privsep process running with capabilities '
+                '(eff/prm/inh): %(eff)s/%(prm)s/%(inh)s',
+                {
+                    'eff': fmt_caps(eff),
+                    'prm': fmt_caps(prm),
+                    'inh': fmt_caps(inh),
+                })
+        elif sys.platform.startswith('freebsd') and self.mac_label:
+            capabilities.apply_mac_label(self.mac_label)
+            LOG.info('privsep process running with MAC label: %s',
+                     self.mac_label)
 
     def _process_cmd(self, msgid, cmd, *args):
         """Executes the requested command in an execution thread.
